@@ -1,0 +1,506 @@
+name: Build IPA — patched (Orion.framework + zxPluginsInject)
+
+# 产物：**只有一份「patched」的 IPA**（tweak 本体 + LC 注入 zxPluginsInject.dylib）。
+# 不带垫片的那份在兄弟文件里：
+#
+#   .github/workflows/build-ipa-with-orion.yml          ← 无 patch
+#   .github/workflows/build-ipa-with-orion-patched.yml  → 本文件（patched）
+#
+# 两个文件各自独立、可以单独跑（Actions 里就是两个入口），**只有标注
+# [PATCHED 差异] 的地方不同**。⚠️ 改公共步骤（Orion 校验 / NO_JBROOT=1 / rpath
+# 修复 / 各种断言……）记得同步另一个文件，检查有没有漂移：
+#
+#     diff .github/workflows/build-ipa-with-orion.yml \
+#          .github/workflows/build-ipa-with-orion-patched.yml
+#
+# 这个工作流的唯一目的：**把 Orion.framework 显式打进 IPA**，不再依赖 cyan 的
+# extras 自动兜底，然后再叠一层侧载兼容垫片。
+#
+# ── 为什么需要它（真机日志实证）────────────────────────────────────────────
+# 原来的两个工作流（buildpatched.yml / build-and-release-yourself.yml）都是：
+#
+#     INJECT=("$DYLIB_SRC" "$FRAMEWORK_SRC" "$BUNDLE_SRC")
+#     cyan -i ... -f "${INJECT[@]}"
+#
+# 里面**没有 Orion.framework**。它们赌的是 cyan 的这段自动逻辑：
+#
+#     for dep in self.get_dependencies():        # otool -L
+#         if "orion." in dep.lower(): needed.add("orion.")
+#     for missing in needed:
+#         shutil.copytree(f"{self.install_dir}/extras/{real}", ip)
+#
+# 而 cyan 对注入相关的子进程普遍带 `stderr=subprocess.DEVNULL`，
+# 一旦 extras 缺文件或 copytree 失败，**不报错、不中断**，照样产出一个
+# "Frameworks/ 里只有 dylib" 的 IPA。装到设备上的表现是：
+#
+#     [01/01] FAIL EeveeSpotify.dylib: dlopen(...):
+#       Library not loaded: @rpath/Orion.framework/Orion
+#       Referenced from: .../Spotify.app/Frameworks/EeveeSpotify.dylib
+#
+# dylib 没加载 → hook 全不生效、启动失败。
+#
+# ── 这个工作流做了什么 ────────────────────────────────────────────────────
+#   1. 显式下载 Orion.framework（从本项目自己 release 里那份 Orion.zip，
+#      说明原文写着 "Orion Framework is provided in Orion.zip for those who need it"）；
+#   2. 校验拿到的是**真二进制**而不是 Theos 的 tapi stub（大小 + 架构两道检查）；
+#   3. 把 Orion.framework 一起传给 cyan；
+#   4. **构建后断言** Orion.framework 确实出现在 IPA 的 Frameworks/ 里，
+#      否则整个 job 失败 —— 让静默失败变成显式失败；
+#   5. 检查主程序有没有 `@executable_path/Frameworks` 这个 rpath，
+#      缺了就补上并重新签名（cyan 同样会静默失败的那一步）；
+#   6. 构建 zxPluginsInject.dylib 并 LC 注入 —— 侧载兼容垫片
+#      (keychain 重定向 / group container / CloudKit stub)。
+#      TrollStore / Sideloadly / AltStore 装**这一份**。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to a decrypted Spotify IPA"
+        default: ""
+        required: true
+        type: string
+      orion_url:
+        description: "URL of the Orion.zip that gets bundled into the app. The default points at this project's own mirror (zbzxbg/es-build-tools), so there is nothing to research and no third-party dependency. Only change it if that URL 404s. NOTE: leaving it EMPTY makes the workflow build Orion from the Theos submodule instead - that path does NOT currently work on GitHub runners, see the comment in the Provide Orion.framework step."
+        default: "https://github.com/zbzxbg/es-build-tools/releases/download/v1.0.0/Orion.zip"
+        required: false
+        type: string
+      upload_method:
+        description: "Where to upload the built IPA(s)"
+        default: "artifacts"
+        required: true
+        type: choice
+        options:
+          - artifacts
+          - filebin
+          - both
+      liquid_glass:
+        description: "Remove UIDesignRequiresCompatibility from Info.plist so iOS 26+ gets the new design language (liquid glass). On by default - that is the current baseline; set it to false to keep Spotify's own compatibility-mode look."
+        default: true
+        required: false
+        type: boolean
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  SWIFTPROTOBUF_VERSION: "1.29.0"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.1.1'
+
+      - name: Setup Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: ${{ github.workspace }}/theos
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          brew install make dpkg ldid wget
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+          # `cyan` 注入器。来源是**本项目自己的镜像**（zbzxbg/es-build-tools 的
+          # v1.0.0 release，内容 = 上游 asdfzxcvbn/pyzule-rw v1.4.4 的原样副本），
+          # 这样上游那个第三方个人仓库被删/改名也不会让所有 fork 一起挂。
+          # 升级：把新版 tarball 传到 es-build-tools 的新 release，再改这里的 URL。
+          python3 -m pip install --upgrade --break-system-packages \
+              "https://github.com/zbzxbg/es-build-tools/releases/download/v1.0.0/pyzule-rw-1.4.4.tar.gz"
+          # [PATCHED 差异] ipapatch 只有 patched 这条路用得到，所以只在本文件里装。
+          # 来源是**本项目自己的镜像**（zbzxbg/es-build-tools v1.0.0），并校验 sha256
+          # —— 这两个哈希是上游 release 页公布的值，镜像里那两个二进制与上游
+          # asdfzxcvbn/ipapatch v2.1.3 **逐字节相同**（已核对）。
+          # 升级：把新版二进制传到 es-build-tools 的新 release，再改 URL 与 WANT。
+          ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && SUFFIX=macos-amd64 || SUFFIX=macos-arm64
+          if [ "$SUFFIX" = "macos-arm64" ]; then
+            WANT=05df2e7310b041891892cf152ce6bbd93574880bf147b96d775051fad796737f
+          else
+            WANT=0577fd7af013991c4e8b24b7a05146d2dd8b0650e1d017c3c538264a34ada0b3
+          fi
+          sudo curl -fsSL "https://github.com/zbzxbg/es-build-tools/releases/download/v1.0.0/ipapatch.${SUFFIX}" \
+              -o /usr/local/bin/ipapatch
+          GOT=$(shasum -a 256 /usr/local/bin/ipapatch | awk '{print $1}')
+          [ "$GOT" = "$WANT" ] || {
+            echo "::error::ipapatch sha256 mismatch (want $WANT, got $GOT)"; exit 1; }
+          sudo chmod +x /usr/local/bin/ipapatch
+          ipapatch --help >/dev/null
+
+      - uses: levibostian/action-hide-sensitive-inputs@v1
+
+      # ── 1. Orion.framework（本工作流存在的主要理由）────────────────────
+      # 默认从**本项目自己的镜像**取（zbzxbg/es-build-tools 的 Orion.zip，
+      # 内容 = 上游那份 v6.6.4 附件 `SideloadLabs/…/Orion.zip` 的原样副本，
+      # sha256 6316e49d487c29aa1ea03767fb8a78b5ea5588b609bdeb8bf6f4528537766658）。
+      # 这样 fork 用户不用研究任何东西，也不再依赖第三方 release。
+      #
+      # ⚠️ `orion_url` 留空时那条「从 theos 子模块自编」的路**跑不通**
+      #    —— GitHub runner 上的 Xcode 缺 iOS 平台组件，xcodebuild 找不到
+      #    `{ generic:1, platform:iOS }` 目标并报 "iOS 26.1 is not installed"。
+      #    自编分支因此只作备用保留；要复活它，先解决 runner 上的平台组件问题。
+      - name: Provide Orion.framework
+        env:
+          ORION_URL: ${{ inputs.orion_url }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/orion"; mkdir -p "$RUNNER_TEMP/orion"
+
+          if [ -z "$ORION_URL" ]; then
+            # ── 备用路径：从 theos 子模块自己编 Orion（⚠️ 见上面：CI 上目前失败）──
+            ORION_SRC="$THEOS/vendor/orion"
+            [ -d "$ORION_SRC" ] || {
+              echo "::error::$ORION_SRC is missing - the Theos checkout did not include submodules."
+              echo "::error::Keep 'submodules: recursive' on the Setup Theos step, or set orion_url to an Orion.zip."
+              exit 1
+            }
+
+            # ⚠️ 要的是 `make package`，**不是** `make vendor`：`make vendor` 会把
+            # `xcrun tapi stubify` 之后的 **stub**（几 KB，只给编译器看）装进
+            # $THEOS/vendor/lib，那份 dlopen 加载不了。真二进制约 215 KB，只存在于
+            # 打包好的 deb 里 —— 所以下面从 deb 把它掏出来（和本仓库从自己的 deb
+            # 掏 EeveeSpotify.dylib 是同一套路）。
+            # 不传 TARGET：theos 在 Darwin 上的默认 target 就是 iphone
+            # （makefiles/platform/Darwin.mk: _THEOS_PLATFORM_DEFAULT_TARGET := iphone）。
+            make -C "$ORION_SRC" clean >/dev/null 2>&1 || true
+            make -C "$ORION_SRC" package FINALPACKAGE=1 || {
+              echo "::error::building Orion from \$THEOS/vendor/orion failed (see the log above)."
+              echo "::error::Workaround: set orion_url to an Orion.zip URL and re-run - see README."
+              exit 1
+            }
+
+            ORION_DEB=$(ls -t "$ORION_SRC"/packages/dev.theos.orion*.deb 2>/dev/null | head -1)
+            [ -n "$ORION_DEB" ] || {
+              echo "::error::Orion produced nothing matching packages/dev.theos.orion*.deb"
+              ls -la "$ORION_SRC/packages" 2>/dev/null | sed 's|^|  |'
+              exit 1
+            }
+            echo "Orion deb: $ORION_DEB"
+
+            dpkg-deb -x "$ORION_DEB" "$RUNNER_TEMP/orion"
+          else
+            # ── 逃生口：外部 Orion.zip（只有源码构建挂掉时才该走这里）──────
+            # 原先这里钉死过一个 sha256，但它只对某一个具体的 zip 有意义，而且
+            # 不匹配也只是 warning；改成"可覆盖的逃生口"之后它不再有意义。
+            echo "Using an external Orion.zip (orion_url was set)"
+            wget "$ORION_URL" --no-verbose -O "$RUNNER_TEMP/Orion.zip"
+            unzip -q "$RUNNER_TEMP/Orion.zip" -d "$RUNNER_TEMP/orion"
+
+            # ⚠️ 必须排除 __MACOSX：这份 zip 是在 macOS 上打的，带 AppleDouble
+            # 元数据目录，里面同样有一个 `__MACOSX/Orion.framework`（只有 `._Orion`，
+            # 没有真正的 `Orion`）。`find` 的遍历顺序会让它先命中，于是后面
+            # "没有 Orion 这个二进制" 直接 fail。
+            rm -rf "$RUNNER_TEMP/orion/__MACOSX"
+          fi
+
+          FW=$(find "$RUNNER_TEMP/orion" -maxdepth 3 -type d -name 'Orion.framework' \
+                 -not -path '*__MACOSX*' | head -1)
+          [ -n "$FW" ] || {
+            echo "::error::no Orion.framework found under \$RUNNER_TEMP/orion (the source build and the escape hatch both land there). Structure:"
+            find "$RUNNER_TEMP/orion" -maxdepth 3 | sed 's|^|  |'
+            exit 1
+          }
+
+          BIN="$FW/Orion"
+          [ -f "$BIN" ] || { echo "::error::$FW does not contain an Orion binary"; exit 1; }
+
+          # ⚠️ 两道检查，缺一不可：
+          #   · 大小：Theos 的 `make vendor` 会执行 `xcrun tapi stubify`，
+          #     vendor 里那份是**给编译器看的 stub**（几 KB）。拿它填进去照样
+          #     dlopen 失败，而且报错更难懂。真二进制约 215 KB。
+          #   · 架构：必须是 arm64，和 ARCHS = arm64 一致。
+          SIZE=$(stat -f%z "$BIN")
+          echo "Orion binary size: $SIZE bytes"
+          [ "$SIZE" -gt 100000 ] || {
+            echo "::error::the Orion binary is only $SIZE bytes - that looks like a tapi stub, not a real framework"; exit 1; }
+
+          file "$BIN"
+          lipo -info "$BIN"
+
+          echo "ORION_FW=$FW" >> $GITHUB_ENV
+          echo "Orion.framework ready: $FW"
+
+      # ── 2. 从源码构建 deb ────────────────────────────────────────────────
+      - name: Build EeveeSwiftProtobuf.framework
+        run: |
+          chmod +x Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
+          Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
+
+      - name: Build .deb (rootless, no jailbreak paths — IPA source only)
+        env:
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          # ⚠️ NO_JBROOT=1 不能去掉。rootless 的 dylib 链着 libroot
+          # (/var/jb/usr/lib/libroot.dylib)，而装这份 IPA 的设备（TrollStore /
+          # 侧载）没有 /var/jb —— libroot 是**加载期**依赖，dyld 一失败
+          # App 直接起不来，只剩一句 dlerror。这份 deb 只当 dylib 的
+          # 来源、不发布（越狱包由 builddeb.yml 出），所以放心按本模式编。
+          THEOS_PACKAGE_SCHEME=rootless NO_JBROOT=1 make package FINALPACKAGE=1
+          DEB_PATH=$(find packages -name "com.eevee.spotify_*.deb" | head -1)
+          [ -n "$DEB_PATH" ] || { echo "::error::deb not produced"; exit 1; }
+          echo "DEB_PATH=$DEB_PATH" >> $GITHUB_ENV
+          echo "deb: $DEB_PATH"
+
+      # [PATCHED 差异] 这一步只有 patched 版有。
+      - name: Build zxPluginsInject.dylib
+        run: |
+          chmod +x Tools/build-zxpi.sh
+          Tools/build-zxpi.sh
+
+      - name: Download & validate vanilla IPA
+        run: |
+          wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/spotify.ipa
+          file_type=$(file --mime-type -b ${{ github.workspace }}/spotify.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Not a valid IPA: $file_type"; exit 1
+          fi
+
+      # ── 3. cyan 注入（Orion 显式参与）────────────────────────────────────
+      - name: Inject deb + Orion.framework into IPA (cyan)
+        run: |
+          set -euo pipefail
+          mkdir -p Outputs/IPAS
+          DEB_EXTRACT="$RUNNER_TEMP/deb-extract"; mkdir -p "$DEB_EXTRACT"
+          dpkg-deb -R "$DEB_PATH" "$DEB_EXTRACT"
+
+          DYLIB_SRC=$(find "$DEB_EXTRACT" -name 'EeveeSpotify.dylib' | head -1)
+          BUNDLE_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSpotify.bundle' | head -1)
+          FRAMEWORK_SRC=$(find "$DEB_EXTRACT" -type d -name 'EeveeSwiftProtobuf.framework' | head -1)
+          [ -n "$DYLIB_SRC" ] || { echo "::error::no EeveeSpotify.dylib inside the deb"; exit 1; }
+
+          SPOT_VERSION=$(unzip -p ${{ github.workspace }}/spotify.ipa 'Payload/Spotify.app/Info.plist' \
+              | plutil -extract CFBundleShortVersionString raw - 2>/dev/null || echo "unknown")
+          EEVEE_VERSION=$(grep -E '^Version:' control | awk '{print $2}')
+          OUT="Outputs/IPAS/EeveeSpotify-${EEVEE_VERSION}-${SPOT_VERSION}-orion.ipa"
+
+          # 本工作流存在的理由：Orion.framework 显式进 INJECT（不再赌 cyan 的
+          #   extras 自动兜底）。cyan 按 basename 分类，`.framework` 会被拷进
+          #   Payload/Spotify.app/Frameworks/。
+          INJECT=("$DYLIB_SRC" "$ORION_FW")
+          [ -n "$FRAMEWORK_SRC" ] && INJECT+=("$FRAMEWORK_SRC")
+          [ -n "$BUNDLE_SRC" ]    && INJECT+=("$BUNDLE_SRC")
+
+          echo "Injection manifest:"
+          printf '  - %s\n' "${INJECT[@]}"
+
+          # -m 与工程的 iOS 底线保持一致（根目录 Makefile 的 `TARGET`），理由同未打补丁的那个工作流：
+          # dylib 按 `TARGET` 编译，这里写低了就会出现"装得上、加载不了"的静默失效。
+          cyan -i ${{ github.workspace }}/spotify.ipa -o "$OUT" \
+               -f "${INJECT[@]}" -c 9 -m 17.4 -du
+          echo "OUT_IPA=$OUT" >> $GITHUB_ENV
+
+      # ── 4. 断言：把静默失败变成显式失败 ──────────────────────────────────
+      - name: Verify Orion.framework actually landed in the IPA
+        run: |
+          set -euo pipefail
+          LISTING="$RUNNER_TEMP/ipa-listing.txt"
+          unzip -l "$OUT_IPA" > "$LISTING"
+
+          echo "== contents of Frameworks/ =="
+          grep -E 'Frameworks/[^/]+/?$' "$LISTING" || true
+
+          TMPX="$RUNNER_TEMP/verify"; rm -rf "$TMPX"; mkdir -p "$TMPX"
+          # 整个 Frameworks/ 都解出来：下面除了查我们自己那份 dylib，还要顺手看看
+          # 注入进去的 framework 有没有越狱路径依赖。
+          unzip -q "$OUT_IPA" 'Payload/Spotify.app/Frameworks/*' -d "$TMPX"
+          DY="$TMPX/Payload/Spotify.app/Frameworks/EeveeSpotify.dylib"
+
+          if otool -L "$DY" | grep -qi orion; then
+            echo "dylib dependency: $(otool -L "$DY" | grep -i orion | head -1)"
+            if grep -q 'Frameworks/Orion.framework/Orion' "$LISTING"; then
+              echo "OK: the IPA contains Frameworks/Orion.framework/Orion"
+            else
+              echo "::error::the dylib depends on @rpath/Orion.framework/Orion, but the IPA's Frameworks/ does not contain it."
+              echo "::error::cyan's automatic re-injection did not take effect (it silences this class of failure with stderr=DEVNULL and passes anyway)."
+              echo "::error::check the Frameworks/ listing above, and whether ORION_FW really holds a binary."
+              exit 1
+            fi
+          else
+            echo "::warning::otool -L on the dylib shows no orion dependency - it was not linked against Orion, so the hooks will not load"
+          fi
+
+          # ── 断言：不许有越狱路径依赖 ─────────────────────────────────────
+          # 踩过的坑：IPA 用的 dylib 是从 rootless deb 里掏出来的，链着
+          # /var/jb/usr/lib/libroot.dylib。装这份 IPA 的设备（TrollStore /
+          # 侧载）没有 /var/jb，而 libroot 是**加载期**依赖 —— dyld 解析失败
+          # 就 dlopen 失败，App 直接起不来，只留一句 dlerror。
+          # 构建已经带了 NO_JBROOT=1，这里再兜一层：谁把那个 flag 删了/漏传，
+          # CI 立刻红，别等用户装上才发现。
+          if otool -L "$DY" | grep -Ei 'libroot|roothide|/var/jb|\.jbroot'; then
+            echo "::error::the injected dylib still depends on a jailbreak-path library (the line above)."
+            echo "::error::libroot / libroothide are load-time dependencies and are absent on TrollStore and sideloaded devices,"
+            echo "::error::as is /var/jb: dyld fails and the app never launches. Make sure the Build .deb step passes NO_JBROOT=1."
+            exit 1
+          else
+            echo "OK: the dylib has no libroot / libroothide / /var/jb dependency"
+          fi
+
+          # 同一个坑的第三方版本：Orion / EeveeSwiftProtobuf 也是注入进去的，
+          # 它们要是链着 /var/jb，IPA 同样装不上。这些不归我们改 → 只 warn，
+          # 但会明确指出来，省得又把锅算到 tweak 头上。
+          while IFS= read -r BIN; do
+            HIT=$(otool -L "$BIN" 2>/dev/null | grep -Ei 'libroot|roothide|/var/jb|\.jbroot' || true)
+            if [ -n "$HIT" ]; then
+              echo "::warning::${BIN#$TMPX/} depends on a jailbreak-path library and may fail to load on TrollStore: $HIT"
+            fi
+          done < <(find "$TMPX/Payload/Spotify.app/Frameworks" -maxdepth 2 -type f)
+
+      # ── 5. rpath：cyan 同样会静默失败的那一步 ───────────────────────────
+      - name: Ensure @executable_path/Frameworks rpath, then add the OpeninSafari extension
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$OUT_IPA")"
+          rm -rf Payload
+          unzip -q "$(basename "$OUT_IPA")"
+          touch Payload/Spotify.app Payload/Spotify.app/Frameworks   # zip timestamp
+          APP="Payload/Spotify.app"
+
+          # Liquid glass switch (ON by default = the current baseline).
+          # Spotify itself ships UIDesignRequiresCompatibility=true in its Info.plist, which asks
+          # iOS 26 to run it in COMPATIBILITY MODE - so the whole app stays out of the new design
+          # language. Removing the key puts the UI into it (SwiftUI Platter navigation bar, system
+          # glass tab bar), which is why it is the default now.
+          # To get Spotify's original look back: set the liquid_glass input to false and re-run.
+          if [ "${{ inputs.liquid_glass || 'true' }}" = "true" ]; then
+            plutil -remove UIDesignRequiresCompatibility "$APP/Info.plist" 2>/dev/null || true
+            echo "★ removed UIDesignRequiresCompatibility - the iOS 26 design language is now active"
+            plutil -p "$APP/Info.plist" | grep -i 'esign' || echo "(no Design key left in Info.plist)"
+          else
+            echo "liquid glass switch is off - keeping Spotify's own UIDesignRequiresCompatibility=true"
+          fi
+
+          echo "== current LC_RPATH =="
+          otool -l "$APP/Spotify" | grep -A2 LC_RPATH || echo "(no LC_RPATH)"
+
+          if otool -l "$APP/Spotify" | grep -q '@executable_path/Frameworks'; then
+            echo "rpath already present, nothing to change"
+          else
+            echo "@executable_path/Frameworks is missing - adding it"
+            ENT="$RUNNER_TEMP/ent.plist"
+            if ldid -e "$APP/Spotify" > "$ENT" 2>/dev/null && [ -s "$ENT" ]; then
+              echo "exported the original entitlements ($(wc -c < "$ENT") bytes)"
+            else
+              ENT=""; echo "this binary has no entitlements"
+            fi
+
+            install_name_tool -add_rpath @executable_path/Frameworks "$APP/Spotify"
+
+            # 改过 load commands 之后原签名失效，必须重新签，否则装上去直接起不来
+            if [ -n "$ENT" ]; then
+              ldid -S"$ENT" "$APP/Spotify"
+            else
+              ldid -S "$APP/Spotify"
+            fi
+            echo "re-signed"
+          fi
+
+          mkdir -p "$APP/PlugIns"
+          rm -rf "$APP/PlugIns/OpenSpotifySafariExtension.appex"
+          if git clone --depth 1 -q https://github.com/BillyCurtis/OpenSpotifySafariExtension.git \
+               "$RUNNER_TEMP/osp" 2>/dev/null && \
+             [ -d "$RUNNER_TEMP/osp/OpenSpotifySafariExtension.appex" ]; then
+            cp -R "$RUNNER_TEMP/osp/OpenSpotifySafariExtension.appex" \
+                  "$APP/PlugIns/OpenSpotifySafariExtension.appex"
+            echo "OpenSpotifySafariExtension injected"
+          else
+            echo "::warning::could not fetch OpenSpotifySafariExtension, skipping (does not affect Orion)"
+          fi
+
+          # AirPods 头部手势要读运动数据，缺这条用途说明会被系统拒绝，而不是静默失败。
+          plutil -insert NSMotionUsageDescription -string "Used for head-gesture track controls on supported headphones." "$APP/Info.plist" 2>/dev/null \
+            || plutil -replace NSMotionUsageDescription -string "Used for head-gesture track controls on supported headphones." "$APP/Info.plist" \
+            || echo "::warning::could not set NSMotionUsageDescription on the host Info.plist"
+
+          # 应用图标（CFBundleAlternateIcons）—— **不注册的话设置里的「应用图标」页是空的**。
+          #
+          # iOS 只认 **app 的 Info.plist 里注册过**的图标：光把 PNG 放进 .app 不够，
+          # 必须在 `CFBundleIcons → CFBundleAlternateIcons` 下写出「名字 → CFBundleIconFiles」。
+          # 设置页那边读的就是这个结构（`EeveeAppIconPickerView.load()`），
+          # 传 `setAlternateIconName` 用的也是同一个名字 —— 两边必须一致。
+          # 脚本 `Tools/alt-icons.sh`：先用 macOS 的 sips 从 `Assets/AppIcon/sources/`
+          # 生成 @2x/@3x/~ipad 各尺寸，再用 PlistBuddy 写键，并**就地**改 app 目录
+          # （所以必须在打包 zip **之前**跑）。当前 34 套图标。
+          # ⚠️ 失败**不致命**：没有图标的包照常能装能跑，只是那一页列不出东西 ——
+          # 所以这里只告警、不中断构建（本仓库没有 Mac，出问题靠 CI 日志定位）。
+          # ⚠️ 另一个 workflow（build-ipa-with-orion.yml）里有同一段，改这里记得同步。
+          if [ -x /usr/libexec/PlistBuddy ]; then
+            echo "== registering app icons (CFBundleAlternateIcons) =="
+            bash "${{ github.workspace }}/Tools/alt-icons.sh" "$APP" \
+              || echo "::warning::app icon registration failed (the app still installs - that settings page is just empty)"
+            plutil -p "$APP/Info.plist" | grep -A3 'CFBundleAlternateIcons' | head -12 \
+              || echo "(no CFBundleAlternateIcons in Info.plist - the icons were not registered)"
+          else
+            echo "::warning::no PlistBuddy available - skipping app icon registration"
+          fi
+
+          rm -f "$(basename "$OUT_IPA")"
+          zip -qry "$(basename "$OUT_IPA")" Payload
+          rm -rf Payload
+
+      # ── 6. [PATCHED 差异] LC 注入 zxPluginsInject ────────────────────────
+      # 这一步（连同上面 Build zxPluginsInject.dylib、装 ipapatch）就是本文件与
+      # build-ipa-with-orion.yml 的**全部实质差别**。
+      # zxPluginsInject = 侧载兼容垫片（keychain 重定向 / group container /
+      # CloudKit stub）；ipapatch 按 LC 注入主程序与每个 appex。
+      - name: LC-inject zxPluginsInject (patched)
+        run: |
+          set -euo pipefail
+          # 无 patch 那份留着没意义（本工作流只产出 patched），直接改名复用，
+          # 免得上传两个几乎一样的文件、又被 GitHub 打进同一个 zip。
+          PATCHED_OUT="${OUT_IPA%.ipa}-patched.ipa"
+          mv "$OUT_IPA" "$PATCHED_OUT"
+          ipapatch --input "$PATCHED_OUT" --inplace --noconfirm \
+                   --dylib packages/zxPluginsInject.dylib
+          echo "PATCHED_OUT=$PATCHED_OUT" >> $GITHUB_ENV
+          echo "patched: $PATCHED_OUT"
+
+      # ipapatch 重写过的条目是"数据描述符"写法（本地头里 csize/usize 为 0）：桌面解压与
+      # python zipfile 都读得动，但 LCSign 这类按本地头走查的工具会直接报"无法打开 zip"。
+      # 这一步把整份包用标准写法重写一遍（条目顺序 / 时间戳 / 权限位不变）。
+      - name: Normalize the IPA zip (no streaming entries)
+        run: |
+          set -euo pipefail
+          python3 "${{ github.workspace }}/Scripts/normalize-ipa.py" "$PATCHED_OUT"
+
+      # ── 7. 上传：本工作流只产出一份（patched）───────────────────────────
+      - name: Upload IPA artifact (patched)
+        if: ${{ inputs.upload_method == 'artifacts' || inputs.upload_method == 'both' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: EeveeSpotify-IPA-orion-patched
+          path: ${{ env.PATCHED_OUT }}
+          if-no-files-found: error
+
+      - name: Summarize the IPA
+        if: ${{ success() }}
+        run: |
+          {
+            echo "### 📱 Artifact from this run: patched"
+            echo ""
+            echo "| File | Contents | Notes |"
+            echo "|---|---|---|"
+            echo "| \`$(basename "$PATCHED_OUT")\` | the tweak itself (Orion + EeveeSpotify.dylib + bundle + EeveeSwiftProtobuf) **+ LC-injected zxPluginsInject.dylib** (keychain redirect / group container / CloudKit stub) | **install this one on TrollStore / Sideloadly / AltStore** |"
+            echo ""
+            echo "No jailbreak-path dependency (the build passes \`NO_JBROOT=1\`, and CI asserts the dylib carries no \`libroot\` / \`/var/jb\`)."
+            echo "RootHide jailbreaks should use the roothide .deb instead."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA to filebin.net
+        if: ${{ inputs.upload_method == 'filebin' || inputs.upload_method == 'both' }}
+        run: |
+          BIN="eevee-orion-patched-${{ github.run_id }}-${{ github.run_attempt }}"
+          FILENAME=$(basename "$PATCHED_OUT")
+          curl -fsS -X POST -H "Content-Type: application/octet-stream" \
+               --data-binary "@${PATCHED_OUT}" \
+               "https://filebin.net/${BIN}/${FILENAME}" >/dev/null
+          {
+            echo "### 📦 filebin.net download (patched)"
+            echo ""
+            echo "- **${FILENAME}:** https://filebin.net/${BIN}/${FILENAME}"
+          } >> "$GITHUB_STEP_SUMMARY"
